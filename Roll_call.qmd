@@ -1,0 +1,691 @@
+---
+title: "Roll Call data analysis"
+author: "Aneta Miniberger"
+editor: visual
+format:
+  html:
+    css: Template_style.css
+    toc: true
+    toc-title: Obsah
+    number-sections: false
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+code-fold: true
+code-tools: true
+embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Setup
+
+### Načítání balíků
+
+```{r}
+#| message: false
+#| warning: false 
+#| label: baliky
+
+library(readr)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(ggplot2)
+library(runjags)
+```
+
+### Načítání dat
+
+```{r}
+#| message: false
+#| warning: false 
+#| label: nacteni_dat
+
+osoby <- read.table(
+  "osoby.unl",          
+  sep = "|",              
+  header = FALSE,         
+  na.strings = "",        
+  quote = "",             
+  stringsAsFactors = FALSE,
+  fileEncoding = "Windows-1250",
+  fill = TRUE            
+)
+
+osoby <- osoby |>
+  rename(
+    id_osoba = V1,
+    prijmeni = V3,
+    jmeno = V4,
+    sex = V7,
+    ) |> select(
+    id_osoba, prijmeni, jmeno, sex
+  )
+
+poslanec <- read.table(
+  "poslanec.unl",           
+  sep = "|",              
+  header = FALSE,        
+  na.strings = "",        
+  quote = "",            
+  stringsAsFactors = FALSE,
+  fileEncoding = "Windows-1250",
+  fill = TRUE             
+)
+
+poslanec <- poslanec |> 
+  rename(
+    id_poslanec = V1,
+    id_osoba = V2
+  ) |>
+  select(id_poslanec, id_osoba)
+
+strany <- read.table(
+  "osoba_extra.unl",           
+  sep = "|",              
+  header = FALSE,        
+  na.strings = "",        
+  quote = "",            
+  stringsAsFactors = FALSE,
+  fileEncoding = "Windows-1250",
+  fill = TRUE             
+)
+
+strany <- strany |> 
+  rename(
+  id_osoba = V1,
+  strana = V5
+) |> select(
+  id_osoba, strana
+)
+
+osoby <- osoby |>
+  full_join(strany, by = "id_osoba")
+
+osoby <- osoby[!duplicated(osoby), ]
+
+poslanec <- poslanec |> 
+  inner_join(osoby, by = "id_osoba")
+
+Y <- read.table(
+  "hl2021h1.unl",           
+  sep = "|",                
+  header = FALSE,          
+  na.strings = "",        
+  quote = "",             
+  stringsAsFactors = FALSE,
+  fileEncoding = "Windows-1252",
+  fill = TRUE             
+)
+
+hlasovani <- read.table(
+  "hl2021s.unl",           
+  sep = "|",              
+  header = FALSE,         
+  na.strings = "",        
+  quote = "",             
+  stringsAsFactors = FALSE,
+  fileEncoding = "Windows-1250",
+  fill = TRUE             
+)
+
+hlasovani <- hlasovani |> 
+  rename(
+    id_hlasovani = V1,
+    schuze = V3,
+    c_hl = V4, 
+    datum = V6,
+    cas = V7,
+    pro = V8,
+    proti = V9,
+    zdrzel = V10,
+    nehlasoval = V11,
+    prihlaseno = V12,
+    druh_hl = V14,
+    vysledek = V15,
+    nazev = V16,
+    nazev_kr = V17
+  )|>
+  select(id_hlasovani, schuze,c_hl, datum, cas, pro,
+        proti,nehlasoval,prihlaseno,druh_hl,vysledek, 
+        nazev, nazev_kr)
+
+Y <- Y |> 
+  rename(
+    id_poslanec = V1,
+    id_hlasovani = V2,
+    vysledek = V3
+  ) |>
+  select(
+    id_poslanec, id_hlasovani, vysledek) |>
+  mutate(
+    vysledek = factor(vysledek, levels = c("A", "B","@","K"),
+                labels = c("ano", "ne", "neprihlášen", "nehlasoval"))
+  )
+
+Y <- Y |>
+  left_join(poslanec |> select(id_poslanec, id_osoba, jmeno, prijmeni), by = "id_poslanec")
+
+Y$jmeno_kom <- paste(Y$jmeno, Y$prijmeni)
+
+```
+
+![Design databáze](images/dbs_design_poslanci.png)
+
+## Analýza
+
+### Úvod {.scrollable}
+
+-   Politologický cíl: **najít abstraktní ideologický postoj pro každého poslance,** který vysvětluje rozdíly v hlasování
+
+    ![](images/clipboard-3825385067.png)
+
+-   Ale ideologie je **latentní** (nepozorovaná), pozorovat ale můžeme výsledky tzv. "*roll-call*" hlasování
+
+-   Matice hlasování: 1 = pro, 0 = proti, NA = zdržel se, chyběl
+
+<!-- -->
+
+-   Zdroj dat: [Data Poslanecké sněmovny](https://www.psp.cz/sqw/hp.sqw?k=1300)
+
+### Zavedení proměnných a předpokladů
+
+Pracujme na $d-$rozměrném ideologickém prostoru. Každý zákonodárce $i$, $i = 1, \dots, N$ má ideální bod $\mathbf{x}_i \in \mathbb{R}^d$. Každý návrh zákona $j$, $j = 1, \dots, M$ má:
+
+-   $\boldsymbol{\zeta}_j \in \mathbb{R}^d$: pozice **přijmutí** zákona v daném ideologickém prostoru
+
+-   $\boldsymbol{\psi}_j \in \mathbb{R}^d$: pozice **odmítnutí** zákona v daném ideologickém prostoru.
+
+Předpokládáme, že zákonodárci mají užitkové funkce
+
+$$ U_i(\boldsymbol{\zeta}_j) = -\|\mathbf{x}_i - \boldsymbol{\zeta}_j\|^2 + \eta_{ij}, \quad U_i(\boldsymbol{\psi}_j) = -\|\mathbf{x}_i - \boldsymbol{\psi}_j\|^2 + \nu_{ij}, $$
+
+kde $\eta_{ij}$ a $\nu_{ij}$ jsou náhodné chyby, u kterých předpokládáme normální rozdělení, nezávislost, nulovou střední hodnotu a $Var( \eta_{ij} - \nu_{ij}) = \sigma_j^2$. Rozhodnutí $i$-tého zákonodárce u $j$-tého zákonu značíme $y_{ij}$. Platí $y_{ij} = 1$, pokud zákonodárce hlasoval pro a $y_{ij} = 0$, pokud hlasoval proti.
+
+### Probitový model
+
+Teoreticky se zákonodárce rozhodne volit pro to, co mu přinse větší užitek, tj. $$\begin{align} P(y_{ij} = 1)  &= P(U_i(\boldsymbol{\zeta}_j) > U_i(\boldsymbol{\psi}_j)) \\ &= P\left( \nu_{ij} - \eta_{ij} < x_i - \psi_j^2 - x_i - \zeta_j^2 \right) \\ &= P\left( \nu_{ij} - \eta_{ij} < 2(\zeta_j - \psi_j)x_i + \psi_j^2 - \zeta_j^2 \right) \\ &= \Phi(\beta_j x_i - \alpha_j) \end{align}$$
+
+Což je zobecněný lineární model s probitovým linkem pro vektor regresorů $x_i$. (Později budeme pracovat s logisickým modelem). Zavedeme následující proměnné:
+
+-   $y^* = \beta_j x_i - \alpha_j + \varepsilon_{ij}$,
+
+-   $m \times d$ matici $\boldsymbol{B}$, jejíž sloupce jsou vektory $\beta_j$,
+
+-   $n \times d$ matici $X$, jejíž řádky jsou vektory $x_i$,
+
+-   $n \times m$ matici $Y$, která je tvořena prvky $y_{ij}$.
+
+### Identifikace
+
+Bez omezení je model **neidentifikovaný**, můžeme dostat stejné výsledky pro rotaci či posun v dimenzi latentních proměnných. Proto musíme zafixovat ideální body pro tolik politiků, aby jednoznačně určili matici $X$. Pro vybrané politiky použijeme spike prior:\
+$\mathbf{x}_i \sim N(c, \nu I)$, kde $\nu$ je velmi malé číslo a $c$ je konstanta.
+
+### Volba apriorních rozdělení
+
+-   $\mathbf{x}_i \sim N(0, I)$,
+-   $\boldsymbol{\beta}_j \sim N(0, \kappa I), \alpha_j \sim N(0, \kappa I)$, kde $\kappa$ je velké číslo.
+
+### Iterační krok t
+
+1\. **Vzorkování** $(y^*_{ij}|y_{ij}, x_i^{t-1}, \beta_j^{t-1}, \alpha_j^{t-1})$:
+
+-   Pokud $y_{ij} = 1$, vzorkujeme $y^*_{ij}$ z useknutého $N(\mu_{ij}, 1)$ na $(0, \infty)$,
+
+-   Pokud $y_{ij} = 0$, tak z useknutého $N(\mu_{ij}, 1)$ na $(-\infty, 0)$,
+
+-   kde $\mu_{ij} = x_i^{t-1} \beta_{j}^{t-1} - \alpha_{j}^{t-1}$
+
+2.  **Vzorkování** $(\beta_{j}^{t}, \alpha_{j}^{t}|y^*_{ij}, x_i^{t-1})$
+    -   Regrese: $y^*_{ij} = x_i^{t-1} \beta_{j}^{t} - \alpha_{j}^{t} + \varepsilon$
+3.  **Vzorkování** $(x_i^{t}|y^*_{ij}, \beta_j^{t}, \alpha_j^{t})$:
+    -   "Opačná" regrese: $y^*_{ij} + \alpha_{j}^{t} = x_i^{t} \beta_{j}^{t} + \varepsilon$
+
+Jak se tento proces změní když budeme pracovat s logistickou regresí? $$
+\Pr(y_{ij} = 1) = \text{logit}^{-1}(x_i \beta_{j} - \alpha_{j})
+$$
+
+## JAGS
+
+### Důchodová reforma
+
+```{r}
+#| message: false
+#| warning: false 
+#| label: selekce
+
+Yjags <- Y |> mutate(
+  vysledek_bin = case_when(
+    vysledek == "ano" ~ 1,
+    vysledek == "ne" ~ 0,
+    TRUE ~ NA_real_
+  )
+)
+
+Yjags <- Yjags |>
+ select(id_hlasovani, jmeno_kom, vysledek_bin) |>
+ pivot_wider(names_from = "id_hlasovani", values_from = "vysledek_bin")
+
+Kotvy <- c("Marek Benda", "Alena Schillerová")
+indKotvy <- which(Yjags$jmeno_kom %in% Kotvy)
+
+Yjags <- Yjags %>%
+  mutate(row_id = row_number()) %>%
+  arrange(jmeno_kom %in% Kotvy %>% desc()) %>%
+  select(-row_id)
+
+vybrani_pos <- c("Karel Havlíček", # ano
+                 "Patrik Nacher", # ano
+                 "Tomio Okamura", # spd
+                 "Hyato Okamura", # kdu
+                 "Vít Rakušan", # stan
+                 "Olga Richterová", #pirati
+                 "Bohuslav Svoboda", #ods
+                 "Marek Výborný", #kdu
+                 "Ivan Bartoš", # pirati
+                 "Petr Liška" # stan  
+                 )
+
+strany <- c("ANO",
+            "ANO",
+            "SPD",
+            "STAN",
+            "PIR",
+            "ODS",
+            "KDU",
+            "PIR",
+            "STAN")
+ind_vybrani <- which(Yjags$jmeno_kom %in% vybrani_pos)
+
+Yjags <- Yjags |> 
+  filter(
+    jmeno_kom %in% vybrani_pos | jmeno_kom %in% Kotvy
+  )
+
+id_duchod <- hlasovani |> 
+  filter(schuze == 55) |>
+  select(id_hlasovani)
+
+id_duchod <- id_duchod$id_hlasovani
+
+Yjags <- Yjags |>
+  select(jmeno_kom, as.character(id_duchod))
+
+mat <- as.matrix(Yjags |> select(-jmeno_kom))
+dimnames(mat) <- NULL
+```
+
+```{r}
+#| code-fold: false
+#| message: false
+#| warning: false 
+#| eval: false
+#| label: JAGS
+
+jags.model <- 
+"model {
+  for(i in 1:N){ 
+    for(j in 1:M){  
+      logit(pi[i,j]) <- x[i] * beta1[j] - beta2[j]
+      y[i,j] ~ dbern(pi[i,j])
+    }
+  }
+
+  for(i in 3:N){ 
+    x[i] ~ dnorm(0, 0.01)
+  }
+  x[1] <- -1 #alena schillerova jako -1
+  x[2] <- 1 #marek benda jako 1
+
+  for(j in 1:M){
+    beta1[j] ~ dnorm(0, 0.04)  
+    beta2[j] ~ dnorm(0, 0.04)  
+  }
+}
+"
+```
+
+```{r}
+#| message: false
+#| warning: false 
+#| eval: false
+#| label: JAGS_run
+
+mat_sampled <- mat
+result <- run.jags(
+  model = jags.model, 
+  data = list(
+    N = nrow(mat_sampled), # pocet poslancu 
+    M = ncol(mat_sampled), # pocet hlasovani 
+    y = mat_sampled #hlasovani poslancu v matici 
+  ),
+  monitor = c("x"), # monitoruji pouze zajmovou promennou
+  n.chains = 1,
+  burnin = 1000, 
+  sample = 5000,
+  adapt = 1000, 
+  confidence = 0.95, 
+  thin = 1, 
+  summarise = FALSE, 
+  silent.jags = TRUE
+)
+
+MCMC <- result$mcmc |> as.matrix(iters = TRUE, chains = TRUE) |> as.data.frame()
+sim <- MCMC |> pivot_longer(-c("CHAIN", "ITER"))
+sim <- as.data.frame(sim)
+
+```
+
+JAGS simulace trvají dlouho - pro zjednodušení práce s tímto reportem tedy analytujeme výsledky, které byly uložené z předchozích běhů.
+
+```{r}
+sim1 <- readRDS("sim1.rds")
+sim <- sim1
+
+sim1 |> 
+  filter(name != "x[1]" & name != "x[2]") |>
+  ggplot(aes(x = value, fill = jmeno, y = after_stat(density))) +
+  geom_histogram(bins = 40,color = "black", linewidth = 0.5) + 
+  labs(x = "", y = "hustota") + 
+  facet_wrap("jmeno", scales = "free_y") + 
+  guides(fill = FALSE) +
+  theme_minimal()+
+  ggtitle(str_wrap("Analýza ideálních bodů vybraných poslanců na základě hlasování z 55. schůze PS (důchodová reforma)", width = 70))
+
+
+sim1 |> 
+ filter(name != "x[1]" & name != "x[2]") |>
+  ggplot(aes(x = value, color = jmeno)) + 
+  geom_density(linewidth = 1.0) + 
+  labs(x = "", y = "hustota", color = "") +
+  theme_minimal() +
+  xlim(-20, 40) +
+  ggtitle(str_wrap("Analýza ideálních bodů vybraných poslanců na základě hlasování z 55. schůze PS (důchodová reforma)", width = 70))
+
+```
+
+```{r}
+stat <- sim1 |> 
+ filter(name != "x[1]" & name != "x[2]") |>
+  group_by(jmeno) |> 
+  summarise(
+      MAP = bayestestR::map_estimate(value)$MAP_Estimate,
+      mean = mean(value), 
+      sd = sd(value), 
+      CI = t(quantile(value, probs = c(0.025, 0.975))),
+      ET = t(HDInterval::hdi(value, credMass = 0.95))
+    )
+
+stat |> kableExtra::kable()
+```
+
+```{r}
+comp <- data.frame(
+  name = stat$jmeno,
+  strana = c("ODS", "KDU", "PIR", "ANO", "KDU", "PIR", "ANO", "SPD", "STAN"),
+  estimate = stat$mean,
+  lower = stat$CI[, 1],
+  upper = stat$CI[, 2]
+)
+comp <- comp |>
+  arrange(estimate |> desc()) |>
+  mutate(name = factor(name, levels = name))
+
+ggplot(comp, aes(x = estimate, y = name, color = strana)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  scale_x_continuous(
+    limits = c(-10, 30),
+    breaks = seq(-10, 30, 10),
+    name = NULL
+  ) +
+  labs(y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 12),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+  )+  ggtitle(str_wrap("Analýza ideálních bodů vybraných poslanců na základě hlasování z 55. schůze PS (důchodová reforma)", width = 40))
+
+```
+
+### Manželství pro všechny
+
+```{r}
+#| label: prep_ex2
+
+Y <- read.table(
+  "hl2021h2.unl",           
+  sep = "|",                
+  header = FALSE,          
+  na.strings = "",        
+  quote = "",             
+  stringsAsFactors = FALSE,
+  fileEncoding = "Windows-1252",
+  fill = TRUE             
+)
+
+Y <- Y |> 
+  rename(
+    id_poslanec = V1,
+    id_hlasovani = V2,
+    vysledek = V3
+  ) |>
+  select(
+    id_poslanec, id_hlasovani, vysledek) |>
+  mutate(
+    vysledek = factor(vysledek, levels = c("A", "B","@","K"),
+                labels = c("ano", "ne", "neprihlášen", "nehlasoval"))
+  )
+
+Y <- Y |>
+  left_join(poslanec |> select(id_poslanec, id_osoba, jmeno, prijmeni), by = "id_poslanec")
+
+Y$jmeno_kom <- paste(Y$jmeno, Y$prijmeni)
+
+Yjags <- Y |> mutate(
+  vysledek_bin = case_when(
+    vysledek == "ano" ~ 1,
+    vysledek == "ne" ~ 0,
+    TRUE ~ NA_real_
+  )
+)
+
+Yjags <- Yjags |>
+ select(id_hlasovani, jmeno_kom, vysledek_bin) |>
+ pivot_wider(names_from = "id_hlasovani", values_from = "vysledek_bin")
+
+
+Kotvy <- c("Josef Bernard", "Pavel Bělobrádek")
+indKotvy <- which(Yjags$jmeno_kom %in% Kotvy)
+
+Yjags <- Yjags %>%
+  mutate(row_id = row_number()) %>%
+  arrange(jmeno_kom %in% Kotvy %>% desc()) %>%
+  select(-row_id)
+
+vybrani_pos <- c("Andrej Babiš", # ano
+                  "Ivan Bartoš", # pirati
+                  "Marek Benda", # ods
+                 "Eva Decroix", #ods
+                 "Martin Exner", # stan 
+                  "Petr Gazdík", # stan
+                  "Nina Nováková", #kdu
+                 "Tomio Okamura", # spd
+                 "Hyato Okamura" # kdu
+                 )
+
+strany <- c("ANO",
+            "PIR",
+            "ODS",
+            "ODS",
+            "STAN",
+            "STAN",
+            "KDU",
+            "SPD",
+            "KDU")
+
+
+ind_vybrani <- which(Yjags$jmeno_kom %in% vybrani_pos)
+Yjags <- Yjags |> 
+  filter(
+    jmeno_kom %in% vybrani_pos | jmeno_kom %in% Kotvy
+  )
+
+
+id_manzeltsvi <- hlasovani |> 
+  filter(schuze == 94) |>
+  select(id_hlasovani)
+
+id_manzeltsvi <- id_manzeltsvi$id_hlasovani
+
+Yjags <- Yjags |>
+  select(jmeno_kom, as.character(id_manzeltsvi))
+
+
+mat <- as.matrix(Yjags |> select(-jmeno_kom))
+dimnames(mat) <- NULL
+```
+
+```{r}
+#| code-fold: false 
+#| message: false
+#| warning: false 
+#| eval: false
+#| label: JAGS2
+
+jags.model <- 
+"model {
+  for(i in 1:N){ 
+    for(j in 1:M){  
+      logit(pi[i,j]) <- x[i] * beta1[j] - beta2[j]
+      y[i,j] ~ dbern(pi[i,j])
+    }
+  }
+
+  for(i in 3:N){ 
+    x[i] ~ dnorm(0, 0.01)
+  }
+  x[1] <- 1 # Josef Bernard jako 1
+  x[2] <- -1 # Pavel Bělobrádek jako -1
+
+  for(j in 1:M){
+    beta1[j] ~ dnorm(0, 0.04)  
+    beta2[j] ~ dnorm(0, 0.04)  
+  }
+}
+"
+```
+
+```{r}
+#| message: false
+#| warning: false 
+#| eval: false
+#| label: JAGS2_run
+
+result <- run.jags(
+  model = jags.model, 
+  data = list(
+    N = nrow(mat), # pocet poslancu 
+    M = ncol(mat),# pocet hlasovani 
+    y = mat #hlasovani poslancu v matici 
+  ),
+  monitor = c("x"), # monitoruji pouze zajmovou promennou
+  n.chains = 1,
+  burnin = 1000, 
+  sample = 5000,
+  adapt = 1000, 
+  confidence = 0.95, 
+  thin = 1, 
+  summarise = FALSE, 
+  silent.jags = TRUE
+)
+MCMC <- result$mcmc |> as.matrix(iters = TRUE, chains = TRUE) |> as.data.frame()
+sim <- MCMC |> pivot_longer(-c("CHAIN", "ITER"))
+sim <- as.data.frame(sim)
+saveRDS(sim, "sim2.rds")
+```
+
+```{r}
+sim2 <- readRDS("sim2.rds")
+sim <- sim2
+
+custom_labels <- c(Kotvy, vybrani_pos)
+levels <- unique(sim$name[str_detect(sim$name, "x")])
+names(custom_labels) <- levels
+names(custom_labels)[11] <- "x[11]"
+jmenax <- data.frame(jmeno = custom_labels, x = names(custom_labels))
+sim <- left_join(sim, jmenax, join_by(name == x))
+
+sim |> 
+ filter(name != "x[1]" & name != "x[2]") |>
+  ggplot(aes(x = value, color = jmeno)) + 
+  geom_density(linewidth = 1.0) + 
+  labs(x = "", y = "hustota", color = "") +
+  theme_minimal() +
+  ggtitle(str_wrap("Analýza ideálních bodů vybraných poslanců na základě hlasování z 94. schůze PS (Manželství pro všechny aj.)", width = 70))
+
+
+sim |> 
+ filter(name != "x[1]" & name != "x[2]") |>
+  ggplot(aes(x = value, color = jmeno)) + 
+  geom_density(linewidth = 1.0) + 
+  labs(x = "", y = "hustota", color = "Jméno") +
+  theme_minimal() +
+  ggtitle(str_wrap("Analýza ideálních bodů vybraných poslanců na základě hlasování z 94. schůze PS (Manželství pro všechny aj.)", width = 70))
+
+```
+
+```{r}
+stat <- sim |> 
+ filter(name != "x[1]" & name != "x[2]") |>
+  group_by(jmeno) |> 
+  summarise(
+      MAP = bayestestR::map_estimate(value)$MAP_Estimate,
+      mean = mean(value), 
+      sd = sd(value), 
+      CI.lwr = t(quantile(value, probs = 0.025)),
+      CI.upr = t(quantile(value, probs = 0.975)),
+      ET.lwr = t(HDInterval::hdi(value, credMass = 0.95))[, 1],
+      ET.upr = t(HDInterval::hdi(value, credMass = 0.95))[, 2]
+    )
+
+stat |> kableExtra::kable()
+```
+
+```{r}
+comp <- data.frame(
+  name = stat$jmeno,
+  strana = c("ANO", "ODS", "PIR","ODS", "STAN","KDU","STAN", "SPD"),
+  estimate = stat$mean,
+  lower = stat$CI.lwr,
+  upper = stat$CI.upr
+)
+comp <- comp |>
+  arrange(estimate |> desc()) |>
+  mutate(name = factor(name, levels = name))
+
+ggplot(comp, aes(x = estimate, y = name, color = strana)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  scale_x_continuous(
+    limits = c(-30, 30),
+    breaks = seq(-30, 30, 10),
+    name = NULL
+  ) +
+  labs(y = NULL, color = "Strana") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 12),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+  ) +
+    ggtitle(str_wrap("Analýza ideálních bodů vybraných poslanců na základě hlasování z 94. schůze PS (Manželství pro všechny aj.)", width = 40))
+
+```
